@@ -12,10 +12,13 @@ import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.res.ColorStateList;
+import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.text.TextUtils;
 import android.text.format.DateFormat;
 import android.view.KeyEvent;
@@ -24,96 +27,175 @@ import android.view.WindowManager;
 import android.widget.ImageView;
 import android.widget.TextView;
 
-import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Locale;
+import java.util.Set;
 
 import cn.modificator.launcher.ftpservice.FTPReceiver;
 import cn.modificator.launcher.ftpservice.FTPService;
 import cn.modificator.launcher.model.AdminReceiver;
 import cn.modificator.launcher.model.AppDataCenter;
 import cn.modificator.launcher.model.HomeEntranceService;
+import cn.modificator.launcher.model.IconCache;
 import cn.modificator.launcher.model.WifiControl;
+import cn.modificator.launcher.widgets.AppItemBinder;
 import cn.modificator.launcher.widgets.BatteryView;
 import cn.modificator.launcher.widgets.EInkLauncherView;
+import cn.modificator.launcher.widgets.LauncherAdapter;
 
 /**
- * Created by mod on 16-4-22.
+ * 主界面 Activity - E-Ink 墨水屏桌面启动器。
  */
-public class Launcher extends Activity {
+public class Launcher extends Activity
+    implements AppItemBinder.Callback, EInkLauncherView.OnPageChangeListener,
+    SettingFragment.OnSettingChangeListener {
 
-  public static final String ROW_NUM_KEY = "rowNumKey";
-  public static final String COL_NUM_KEY = "colNumKey";
-  public static final String APP_NAME_SHOW_LINES = "appNameShowLines";
-  public static final String HIDE_APPS_KEY = "hideAppsKey";
-  public static final String DELETEAPP = "deleteApp";
-  public static final String LAUNCHER_SHOW_STATUS_BAR = "launcherShowStatusBar";
-  public static final String LAUNCHER_SHOW_CUSTOM_ICON= "launcherShowCustomIcon";
-  public static final String LAUNCHER_ACTION = "launcherReceiver";
-  public static final String LAUNCHER_FONT_SIZE = "launcherFontSize";
-  public static final String LAUNCHER_HIDE_DIVIDER = "launcherHideDivider";
+  private static final int REQUEST_DEVICE_ADMIN = 10001;
 
-  EInkLauncherView launcherView;
-  AppDataCenter dataCenter = null;
-  Config config;
-  LauncherUpdateReceiver updateReceiver;
-  TextView pageStatus;
-  BatteryView batteryProgress;
-  TextView batteryStatus, textClock;
+  // ---- Views ----
+  private EInkLauncherView launcherView;
+  private TextView pageStatus;
+  private BatteryView batteryProgress;
+  private TextView batteryStatus;
+  private TextView textClock;
 
-  BroadcastReceiver timeListener;
-  Calendar mCalendar;
+  // ---- Data ----
+  private AppDataCenter dataCenter;
+  private Config config;
+  private Calendar calendar;
+  private boolean isChina = true;
+  private IconCache iconCache;
+  private LauncherAdapter adapter;
+  private AppItemBinder binder;
+  private boolean isSystemApp = false;
 
-  DevicePolicyManager policyManager;
-  File iconFile;
-  boolean isChina = true;
-  FTPReceiver ftpReceiver = new FTPReceiver();
+  // ---- Device Admin ----
+  private DevicePolicyManager policyManager;
+
+  // ---- Receivers ----
+  private FTPReceiver ftpReceiver = new FTPReceiver();
+  private boolean batteryRegistered;
+  private boolean timeRegistered;
+  private boolean usbRegistered;
+  private boolean ftpRegistered;
+
+  private final BroadcastReceiver timeReceiver = new BroadcastReceiver() {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      updateTimeShow();
+    }
+  };
+
+  private final BroadcastReceiver batteryReceiver = new BroadcastReceiver() {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      handleBatteryChanged(intent);
+    }
+  };
+
+  private final BroadcastReceiver appChangeReceiver = new BroadcastReceiver() {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      iconCache.clearAppCache();
+      dataCenter.refreshAppList(binder.isDelete());
+    }
+  };
+
+  private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      String action = intent.getAction();
+      if (Intent.ACTION_MEDIA_MOUNTED.equals(action)) {
+        iconCache.markDirty();
+        refreshIcons();
+      }
+    }
+  };
+
+  // =========================================================================
+  // Lifecycle
+  // =========================================================================
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     setContentView(R.layout.launcher_activity);
+
     config = new Config(this);
     WifiControl.init(this);
-    toggleStatusBar();
-    if (getExternalCacheDir() != null) {
-      iconFile = new File(getExternalCacheDir().getParentFile().getParentFile().getParentFile().getParentFile(), "E-Ink Launcher" + File.separator + "icon");
-      if (!iconFile.exists()) {
-        iconFile.mkdir();
-      }
-    }
+    applyStatusBarVisibility();
 
     isChina = getResources().getConfiguration().locale.getCountry().equals("CN");
 
-    initView();
+    initViews();
+    registerStaticReceivers();
     checkLaunchHomeNotification();
   }
 
+  @Override
+  protected void onResume() {
+    super.onResume();
+    registerDynamicReceivers();
+    refreshIcons();
+  }
 
-  private void initView() {
+  @Override
+  protected void onPause() {
+    super.onPause();
+    unregisterDynamicReceivers();
+  }
+
+  @Override
+  protected void onDestroy() {
+    super.onDestroy();
+    unregisterDynamicReceivers();
+    unregisterReceiver(appChangeReceiver);
+  }
+
+  // =========================================================================
+  // View 初始化
+  // =========================================================================
+
+  private void initViews() {
     policyManager = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+
     launcherView = findViewById(R.id.mList);
     pageStatus = findViewById(R.id.pageStatus);
     batteryProgress = findViewById(R.id.batteryProgress);
     batteryStatus = findViewById(R.id.batteryStatus);
     textClock = findViewById(R.id.textClock);
-    (this.<ImageView>findViewById(R.id.toSetting)).setImageDrawable(Utils.tintDrawable(getResources().getDrawable(R.drawable.navibar_icon_settings_highlight), ColorStateList.valueOf(0xff000000)));
 
-//        launcherView.setIconReplaceFile(Arrays.asList(iconFile.list()));
-    launcherView.setHideAppPkg(config.getHideApps());
-    launcherView.setHideDivider(config.getDividerHideStatus());
-    launcherView.setFontSize(config.getFontSize());
+    ImageView settingIcon = findViewById(R.id.toSetting);
+    settingIcon.setImageDrawable(
+        Utils.tintDrawable(getResources().getDrawable(R.drawable.navibar_icon_settings_highlight),
+            ColorStateList.valueOf(0xff000000)));
 
+    // 配置 Binder、Adapter、View
+    iconCache = new IconCache();
+    binder = new AppItemBinder(getPackageManager());
+    binder.setCallback(this);
+    binder.setIconCache(iconCache);
+    binder.setHideAppPkg(config.getHideApps());
+    adapter = new LauncherAdapter();
+    adapter.setBinder(binder);
+    adapter.setFontSize(config.getFontSize());
+    adapter.setAppNameLines(config.getAppNameLines());
+    launcherView.setAdapter(adapter);
+    launcherView.setOnPageChangeListener(this);
+
+    // 初始化数据中心
     dataCenter = new AppDataCenter(this);
+    dataCenter.setSortMode(config.getSortMode());
     dataCenter.setHideApps(config.getHideApps());
-
     dataCenter.setPageStatus(pageStatus);
-    dataCenter.setLauncherView(launcherView);
-    //加载之前保存的桌面数据
-    updateColNum(config.getColNum());
-    updateRowNum(config.getRowNum());
+    dataCenter.setAdapter(adapter);
 
+    // 一次性配置网格参数，避免多次重建
+    launcherView.configure(config.getColNum(), config.getRowNum(), config.isHideDivider());
+    dataCenter.setGridSize(config.getColNum(), config.getRowNum());
+
+    // 翻页按钮
     findViewById(R.id.lastPage).setOnClickListener(new View.OnClickListener() {
       @Override
       public void onClick(View v) {
@@ -126,286 +208,369 @@ public class Launcher extends Activity {
         dataCenter.showNextPage();
       }
     });
+
+    // 设置按钮
     findViewById(R.id.toSetting).setOnClickListener(new View.OnClickListener() {
       @Override
       public void onClick(View v) {
         getFragmentManager().beginTransaction()
-            .replace(android.R.id.content, new SettingFramgent())
+            .replace(android.R.id.content, new SettingFragment())
             .addToBackStack(null)
             .commit();
       }
     });
+
+    // 管理完成按钮
     findViewById(R.id.deleteFinish).setOnClickListener(new View.OnClickListener() {
       @Override
       public void onClick(View v) {
-        launcherView.setDelete(false);
+        binder.setDelete(false);
         dataCenter.refreshAppList();
         config.setHideApps(dataCenter.getHideApps());
         v.setVisibility(View.GONE);
       }
     });
-    launcherView.setTouchListener(new EInkLauncherView.TouchListener() {
-      @Override
-      public void toNext() {
-        dataCenter.showNextPage();
-      }
 
-      @Override
-      public void toLast() {
-        dataCenter.showLastPage();
-      }
-    });
-//        android:format12Hour="yyyy-MM-dd aahh:mm EEEE"
-//        android:format24Hour="yyyy-MM-dd aahh:mm EEEE"
-
-    mCalendar = Calendar.getInstance();
-
+    // 时间显示
+    calendar = Calendar.getInstance();
     updateTimeShow();
 
-    updateReceiver = new LauncherUpdateReceiver();
-    IntentFilter filter = new IntentFilter();
-    filter.addAction(LAUNCHER_ACTION);
-    registerReceiver(updateReceiver, filter);
-
-
-    IntentFilter appChangeFilter = new IntentFilter();
-    appChangeFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
-    appChangeFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
-    appChangeFilter.addAction(Intent.ACTION_PACKAGE_REPLACED);
-    appChangeFilter.addDataScheme("package");
-    registerReceiver(appChangeReceiver, appChangeFilter);
-
+    // 检测系统应用
     try {
-      launcherView.setSystemApp(!isUserApp(getPackageManager().getPackageInfo(getPackageName(), 0)));
+      isSystemApp = !isUserApp(getPackageManager().getPackageInfo(getPackageName(), 0));
     } catch (PackageManager.NameNotFoundException e) {
       e.printStackTrace();
     }
   }
 
-  private void updateRowNum(int rowNum) {
+  // =========================================================================
+  // SettingFragment.OnSettingChangeListener 实现
+  // =========================================================================
+
+  @Override
+  public void onRowNumChanged(int rowNum) {
     launcherView.setRowNum(rowNum);
     dataCenter.setRowNum(rowNum);
-    config.setRowNum(rowNum);
   }
 
-  private void updateColNum(int colNum) {
+  @Override
+  public void onColNumChanged(int colNum) {
     launcherView.setColNum(colNum);
     dataCenter.setColNum(colNum);
-    config.setColNum(colNum);
   }
 
   @Override
-  public boolean onKeyUp(int keyCode, KeyEvent event) {
-    if (keyCode == KeyEvent.KEYCODE_PAGE_UP) {
-      dataCenter.showLastPage();
-    } else if (keyCode == KeyEvent.KEYCODE_PAGE_DOWN) {
-      dataCenter.showNextPage();
-    } else if (keyCode == KeyEvent.KEYCODE_BACK) {
-      return true;
-    }
-    return super.onKeyUp(keyCode, event);
+  public void onFontSizeChanged(float size) {
+    adapter.setFontSize(size);
   }
 
   @Override
-  protected void onResume() {
-    super.onResume();
-    IntentFilter batteryLevelFilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-    registerReceiver(batteryLevelRcvr, batteryLevelFilter);
-    timeListener = new BroadcastReceiver() {
-      @Override
-      public void onReceive(Context context, Intent intent) {
-        updateTimeShow();
-      }
-    };
-    updateTimeShow();
-
-    registerReceiver(timeListener, new IntentFilter(Intent.ACTION_TIME_TICK));
-    if (launcherView != null) launcherView.refreshReplaceIcon();
-    detectionUSB();
-
-    IntentFilter ftpIntentFilter = new IntentFilter(FTPService.ACTION_START_FTPSERVER);
-    ftpIntentFilter.addAction(FTPService.ACTION_STOP_FTPSERVER);
-    registerReceiver(ftpReceiver,ftpIntentFilter);
+  public void onAppNameLinesChanged(int lines) {
+    adapter.setAppNameLines(lines);
   }
 
-  /**
-   * 刷新时间显示
-   */
-  private void updateTimeShow() {
-    if (textClock != null && mCalendar != null) {
-      boolean is24Hour = DateFormat.is24HourFormat(this);
-      mCalendar.setTimeInMillis(System.currentTimeMillis());
+  @Override
+  public void onHideDividerChanged(boolean hide) {
+    launcherView.setHideDivider(hide);
+  }
 
-      StringBuilder timeFormatTextBuilder = new StringBuilder("yyyy-MM-dd ");
-      if (!is24Hour && isChina) {
-        timeFormatTextBuilder.append(Utils.getAMPMCNString(mCalendar.get(Calendar.HOUR), mCalendar.get(Calendar.AM_PM)));
-      }
-      if (is24Hour) {
-        timeFormatTextBuilder.append("HH:mm");
-      } else {
-        timeFormatTextBuilder.append("hh:mm");
-      }
-      if (!is24Hour && !isChina) {
-        timeFormatTextBuilder.append(" a");
-      }
-      timeFormatTextBuilder.append(" EEEE");
-      textClock.setText(new SimpleDateFormat(timeFormatTextBuilder.toString(), Locale.getDefault()).format(mCalendar.getTime()));
+  @Override
+  public void onShowStatusBarChanged(boolean show) {
+    applyStatusBarVisibility();
+  }
+
+  @Override
+  public void onShowCustomIconChanged(boolean show) {
+    iconCache.markDirty();
+    refreshIcons();
+  }
+
+  @Override
+  public void onEnterManageMode() {
+    binder.setDelete(true);
+    dataCenter.refreshAppList(true);
+    findViewById(R.id.deleteFinish).setVisibility(View.VISIBLE);
+  }
+
+  @Override
+  public void onSortModeChanged(int mode) {
+    dataCenter.setSortMode(mode);
+    dataCenter.refreshAppList(binder.isDelete());
+  }
+
+  // =========================================================================
+  // 布局更新
+  // =========================================================================
+
+  private void refreshIcons() {
+    if (adapter == null || iconCache == null) return;
+    iconCache.refreshCustomIcons(getExternalCacheDir() != null, config.isShowCustomIcon());
+    adapter.refreshDisplay();
+  }
+
+  // =========================================================================
+  // AppItemBinder.Callback 实现
+  // =========================================================================
+
+  @Override
+  public void onItemClick(ResolveInfo info) {
+    String pkgName = info.activityInfo.packageName;
+
+    if (AppDataCenter.LOCK_PACKAGE_NAME.equals(pkgName)) {
+      lockScreen();
+    } else if (AppDataCenter.WIFI_PACKAGE_NAME.equals(pkgName)) {
+      WifiControl.onClickWifiItem();
+    } else {
+      ComponentName comp = new ComponentName(info.activityInfo.packageName, info.activityInfo.name);
+      Intent intent = new Intent(Intent.ACTION_MAIN);
+      intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+      intent.addCategory(Intent.CATEGORY_LAUNCHER);
+      intent.setComponent(comp);
+      startActivity(intent);
     }
   }
 
   @Override
-  protected void onPause() {
-    super.onPause();
-    unregisterReceiver(batteryLevelRcvr);
-    unregisterReceiver(timeListener);
-    unregisterReceiver(usbReceiver);
-    unregisterReceiver(ftpReceiver);
+  public void onItemLongClick(View anchor, ResolveInfo info) {
+    String packageName = info.activityInfo.packageName;
+
+    if (AppDataCenter.LOCK_PACKAGE_NAME.equals(packageName)) {
+      showPowerMenu();
+    } else if (AppDataCenter.WIFI_PACKAGE_NAME.equals(packageName)) {
+      WifiControl.onLongClickWifiItem();
+    } else {
+      showAppInfoDialog(info, packageName);
+    }
   }
 
   @Override
-  protected void onDestroy() {
-    super.onDestroy();
-    unregisterReceiver(updateReceiver);
-    unregisterReceiver(appChangeReceiver);
-    try {
-      unregisterReceiver(usbReceiver);
-    } catch (Throwable throwable) {
-      throwable.printStackTrace();
-    }
+  public void onItemDeleteClick(ResolveInfo info) {
+    Intent deleteIntent = new Intent(Intent.ACTION_DELETE,
+        Uri.parse("package:" + info.activityInfo.packageName));
+    startActivity(deleteIntent);
   }
 
-
-  class LauncherUpdateReceiver extends BroadcastReceiver {
-
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      Bundle bundle = intent.getExtras();
-      if (bundle.containsKey(ROW_NUM_KEY)) {
-        updateRowNum(bundle.getInt(ROW_NUM_KEY));
-      } else if (bundle.containsKey(COL_NUM_KEY)) {
-        updateColNum(bundle.getInt(COL_NUM_KEY));
-      } else if (bundle.containsKey(DELETEAPP)) {
-        launcherView.setDelete(true);
-
-        //显示所有App
-        dataCenter.refreshAppList(true);
-        findViewById(R.id.deleteFinish).setVisibility(View.VISIBLE);
-      } else if (bundle.containsKey(LAUNCHER_FONT_SIZE)) {
-        launcherView.setFontSize(bundle.getFloat(LAUNCHER_FONT_SIZE));
-      } else if (bundle.containsKey(LAUNCHER_HIDE_DIVIDER)) {
-        launcherView.setHideDivider(bundle.getBoolean(LAUNCHER_HIDE_DIVIDER));
-        config.setDividerHideStatus(bundle.getBoolean(LAUNCHER_HIDE_DIVIDER));
-      }else if (bundle.containsKey(LAUNCHER_SHOW_STATUS_BAR)){
-        config.setStatusBarShowStatus(bundle.getBoolean(LAUNCHER_SHOW_STATUS_BAR));
-        toggleStatusBar();
-      }else if (bundle.containsKey(LAUNCHER_SHOW_CUSTOM_ICON)){
-        config.setCustomIconShowStatus(bundle.getBoolean(LAUNCHER_SHOW_CUSTOM_ICON));
-        launcherView.refreshReplaceIcon();
-      }else if (bundle.containsKey(APP_NAME_SHOW_LINES)){
-        int lines = bundle.getInt(APP_NAME_SHOW_LINES);
-        if (lines==3)lines=Integer.MAX_VALUE;
-        config.setAppNameLines(lines);
-        launcherView.updateAppNameLines();
-      }
-    }
+  @Override
+  public void onItemHideToggle(String packageName, boolean hidden) {
+    // 管理模式下的隐藏切换仅更新 UI 状态，"完成" 按钮处理持久化
   }
 
-  BroadcastReceiver appChangeReceiver = new BroadcastReceiver() {
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      dataCenter.refreshAppList(launcherView.isDelete());
-    }
-  };
-  BroadcastReceiver batteryLevelRcvr = new BroadcastReceiver() {
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      int rawlevel = intent.getIntExtra("level", -1);
-      int scale = intent.getIntExtra("scale", -1);
-      int status = intent.getIntExtra("status", -1);
-      int health = intent.getIntExtra("health", -1);
-      int level = -1; // percentage, or -1 for unknown
-      if (rawlevel >= 0 && scale > 0) {
-        level = (rawlevel * 100) / scale;
-      }
-      batteryProgress.setProgress(level);
+  // =========================================================================
+  // EInkLauncherView.OnPageChangeListener 实现
+  // =========================================================================
 
-      batteryStatus.setVisibility(View.VISIBLE);
-      if (BatteryManager.BATTERY_HEALTH_OVERHEAT == health) {
-        batteryStatus.setText(R.string.battery_heat);
-      } else {
-        switch (status) {
-          case BatteryManager.BATTERY_STATUS_UNKNOWN:
-            batteryStatus.setText(R.string.battery_unknown);
-            break;
-          case BatteryManager.BATTERY_STATUS_CHARGING:
-            batteryStatus.setText(R.string.battery_charging);
-                        /*if (level <= 33)
-                            sb.append(" is charging, battery level is low"
-                                    + "[" + level + "]");
-                        else if (level <= 84)
-                            sb.append(" is charging." + "[" + level + "]");
-                        else
-                            sb.append(" will be fully charged.");*/
-            break;
-          case BatteryManager.BATTERY_STATUS_DISCHARGING:
-          case BatteryManager.BATTERY_STATUS_NOT_CHARGING:
-                        /*if (level == 0)
-                            sb.append(" needs charging right away.");
-                        else if (level > 0 && level <= 33)
-                            sb.append(" is about ready to be recharged, battery level is low"
-                                    + "[" + level + "]");
-                        else
-                            sb.append("'s battery level is" + "[" + level + "]");*/
-            if (level < 15) {
-              batteryStatus.setText(R.string.battery_low);
+  @Override
+  public void onPageNext() {
+    dataCenter.showNextPage();
+  }
+
+  @Override
+  public void onPagePrev() {
+    dataCenter.showLastPage();
+  }
+
+  private void showPowerMenu() {
+    if (!isSystemApp) return;
+    new AlertDialog.Builder(this)
+        .setTitle(R.string.power_title)
+        .setItems(R.array.power_menu, new DialogInterface.OnClickListener() {
+          @Override
+          public void onClick(DialogInterface dialog, int which) {
+            if (which == 0) {
+              Intent intent = new Intent("android.intent.action.ACTION_REQUEST_SHUTDOWN");
+              intent.putExtra("android.intent.extra.KEY_CONFIRM", false);
+              intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              startActivity(intent);
             } else {
-              batteryStatus.setVisibility(View.GONE);
+              PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+              pm.reboot("重启");
             }
-            break;
-          case BatteryManager.BATTERY_STATUS_FULL:
-//                        sb.append(" is fully charged.");
-            batteryStatus.setText(R.string.battery_full);
-            break;
-          default:
-//                        sb.append("'s battery is indescribable!");
-            batteryStatus.setText(R.string.battery_wtf);
-            break;
-        }
-      }
+          }
+        })
+        .setPositiveButton(R.string.dialog_cancel, null)
+        .show();
+  }
 
+  private void showAppInfoDialog(ResolveInfo info, final String packageName) {
+    new AlertDialog.Builder(this)
+        .setIcon(iconCache.getIcon(packageName, info, getPackageManager()))
+        .setTitle(iconCache.getLabel(packageName, info, getPackageManager()))
+        .setMessage(getString(R.string.dialog_pkg_name, packageName))
+        .setPositiveButton(R.string.dialog_cancel, null)
+        .setNeutralButton(R.string.dialog_hide, new DialogInterface.OnClickListener() {
+          @Override
+          public void onClick(DialogInterface dialog, int which) {
+            Set<String> hideApps = binder.getHideAppPkg();
+            if (!hideApps.add(packageName)) {
+              hideApps.remove(packageName);
+            }
+            dataCenter.refreshAppList();
+          }
+        })
+        .setNegativeButton(R.string.dialog_uninstall, new DialogInterface.OnClickListener() {
+          @Override
+          public void onClick(DialogInterface dialog, int which) {
+            Intent deleteIntent = new Intent(Intent.ACTION_DELETE,
+                Uri.parse("package:" + packageName));
+            startActivity(deleteIntent);
+          }
+        })
+        .show();
+  }
+
+  // =========================================================================
+  // 时间显示
+  // =========================================================================
+
+  private void updateTimeShow() {
+    if (textClock == null || calendar == null) return;
+
+    boolean is24Hour = DateFormat.is24HourFormat(this);
+    calendar.setTimeInMillis(System.currentTimeMillis());
+
+    StringBuilder sb = new StringBuilder("yyyy-MM-dd ");
+    if (!is24Hour && isChina) {
+      sb.append(Utils.getAMPMCNString(calendar.get(Calendar.HOUR), calendar.get(Calendar.AM_PM)));
     }
-  };
+    sb.append(is24Hour ? "HH:mm" : "hh:mm");
+    if (!is24Hour && !isChina) {
+      sb.append(" a");
+    }
+    sb.append(" EEEE");
 
-  private void detectionUSB() {
+    textClock.setText(new SimpleDateFormat(sb.toString(), Locale.getDefault()).format(calendar.getTime()));
+  }
+
+  // =========================================================================
+  // 电池信息
+  // =========================================================================
+
+  private void handleBatteryChanged(Intent intent) {
+    int rawLevel = intent.getIntExtra("level", -1);
+    int scale = intent.getIntExtra("scale", -1);
+    int status = intent.getIntExtra("status", -1);
+    int health = intent.getIntExtra("health", -1);
+
+    int level = (rawLevel >= 0 && scale > 0) ? (rawLevel * 100) / scale : -1;
+    batteryProgress.setProgress(level);
+    batteryStatus.setVisibility(View.VISIBLE);
+
+    if (BatteryManager.BATTERY_HEALTH_OVERHEAT == health) {
+      batteryStatus.setText(R.string.battery_heat);
+      return;
+    }
+
+    switch (status) {
+      case BatteryManager.BATTERY_STATUS_UNKNOWN:
+        batteryStatus.setText(R.string.battery_unknown);
+        break;
+      case BatteryManager.BATTERY_STATUS_CHARGING:
+        batteryStatus.setText(R.string.battery_charging);
+        break;
+      case BatteryManager.BATTERY_STATUS_DISCHARGING:
+      case BatteryManager.BATTERY_STATUS_NOT_CHARGING:
+        if (level < 15) {
+          batteryStatus.setText(R.string.battery_low);
+        } else {
+          batteryStatus.setVisibility(View.GONE);
+        }
+        break;
+      case BatteryManager.BATTERY_STATUS_FULL:
+        batteryStatus.setText(R.string.battery_full);
+        break;
+      default:
+        batteryStatus.setText(R.string.battery_wtf);
+        break;
+    }
+  }
+
+  // =========================================================================
+  // 广播注册/注销
+  // =========================================================================
+
+  /** 注册生命周期不变的静态广播 */
+  private void registerStaticReceivers() {
+    // 应用安装/卸载广播
+    IntentFilter appChangeFilter = new IntentFilter();
+    appChangeFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+    appChangeFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+    appChangeFilter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+    appChangeFilter.addDataScheme("package");
+    registerCompatReceiver(appChangeReceiver, appChangeFilter);
+  }
+
+  /** 注册跟随 onResume/onPause 的动态广播 */
+  private void registerDynamicReceivers() {
+    if (!batteryRegistered) {
+      registerCompatReceiver(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+      batteryRegistered = true;
+    }
+    if (!timeRegistered) {
+      registerCompatReceiver(timeReceiver, new IntentFilter(Intent.ACTION_TIME_TICK));
+      timeRegistered = true;
+    }
+    updateTimeShow();
+    if (!usbRegistered) {
+      registerUsbReceiver();
+    }
+    if (!ftpRegistered) {
+      IntentFilter ftpFilter = new IntentFilter(FTPService.ACTION_START_FTPSERVER);
+      ftpFilter.addAction(FTPService.ACTION_STOP_FTPSERVER);
+      registerCompatReceiver(ftpReceiver, ftpFilter);
+      ftpRegistered = true;
+    }
+  }
+
+  private void unregisterDynamicReceivers() {
+    if (batteryRegistered) {
+      unregisterReceiver(batteryReceiver);
+      batteryRegistered = false;
+    }
+    if (timeRegistered) {
+      unregisterReceiver(timeReceiver);
+      timeRegistered = false;
+    }
+    if (usbRegistered) {
+      unregisterReceiver(usbReceiver);
+      usbRegistered = false;
+    }
+    if (ftpRegistered) {
+      unregisterReceiver(ftpReceiver);
+      ftpRegistered = false;
+    }
+  }
+
+  private void registerUsbReceiver() {
     IntentFilter usbFilter = new IntentFilter();
     usbFilter.addAction(Intent.ACTION_UMS_DISCONNECTED);
     usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);
     usbFilter.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
     usbFilter.addAction(Intent.ACTION_MEDIA_REMOVED);
     usbFilter.addDataScheme("file");
-    registerReceiver(usbReceiver, usbFilter);
+    registerCompatReceiver(usbReceiver, usbFilter);
+    usbRegistered = true;
   }
 
-  private BroadcastReceiver usbReceiver = new BroadcastReceiver() {
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      String action = intent.getAction();
-      if (action.equals(Intent.ACTION_MEDIA_REMOVED)
-          || action.equals(Intent.ACTION_MEDIA_UNMOUNTED)) {
-        //设备卸载成功;
-      } else if (action.equals(Intent.ACTION_MEDIA_MOUNTED)) {
-        //设备挂载成功
-        launcherView.refreshReplaceIcon();
-      }
-    }
-  };
+  private void registerCompatReceiver(BroadcastReceiver receiver, IntentFilter filter) {
+    Utils.registerReceiverCompat(this, receiver, filter);
+  }
+
+  // =========================================================================
+  // 按键处理
+  // =========================================================================
 
   @Override
-  public void onBackPressed() {
-    if (getFragmentManager().getBackStackEntryCount() > 0) {
-      super.onBackPressed();
-      config.saveFontSize();
+  public boolean onKeyUp(int keyCode, KeyEvent event) {
+    if (keyCode == KeyEvent.KEYCODE_PAGE_UP) {
+      dataCenter.showLastPage();
+      return true;
+    } else if (keyCode == KeyEvent.KEYCODE_PAGE_DOWN) {
+      dataCenter.showNextPage();
+      return true;
+    } else if (keyCode == KeyEvent.KEYCODE_BACK) {
+      return true;
     }
+    return super.onKeyUp(keyCode, event);
   }
 
   @Override
@@ -416,86 +581,90 @@ public class Launcher extends Activity {
     return super.onKeyDown(keyCode, event);
   }
 
+  @Override
+  public void onBackPressed() {
+    if (getFragmentManager().getBackStackEntryCount() > 0) {
+      super.onBackPressed();
+      config.setFontSize(config.getFontSize());
+    }
+  }
+
+  // =========================================================================
+  // 锁屏
+  // =========================================================================
+
   public void lockScreen() {
     try {
       if (policyManager.isAdminActive(new ComponentName(this, AdminReceiver.class))) {
         policyManager.lockNow();
       } else {
-        activeManage();
+        requestDeviceAdmin();
       }
-    }catch (Exception e){
-      openDevicePolicyManager();
+    } catch (Exception e) {
+      showDeviceAdminDialog();
     }
   }
 
-  private void openDevicePolicyManager() {
-    new AlertDialog.Builder(this)
-            .setTitle(R.string.launch_failed)
-            .setMessage(R.string.launch_devicemanager_failed)
-            .setPositiveButton(R.string.launch_devicemanager, new DialogInterface.OnClickListener() {
-              @Override
-              public void onClick(DialogInterface dialog, int which) {
-                try {
-                  Intent intent = Intent.parseUri("intent:#Intent;component=com.android.settings/.DeviceAdminSettings;end", Intent.URI_INTENT_SCHEME);
-                  intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                  startActivity(intent);
-                } catch (Exception e) {
-                  e.printStackTrace();
-                }
-              }
-            })
-            .setNegativeButton(R.string.dialog_cancel, null).show();
-  }
-
-  private void activeManage() {
+  private void requestDeviceAdmin() {
     Intent intent = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
     intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, new ComponentName(this, AdminReceiver.class));
     intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "E-Ink Launcher 获取锁屏权限");
     startActivity(intent);
-//    startActivityForResult(intent, 10001);
+  }
+
+  private void showDeviceAdminDialog() {
+    new AlertDialog.Builder(this)
+        .setTitle(R.string.launch_failed)
+        .setMessage(R.string.launch_devicemanager_failed)
+        .setPositiveButton(R.string.launch_devicemanager, new DialogInterface.OnClickListener() {
+          @Override
+          public void onClick(DialogInterface dialog, int which) {
+            try {
+              Intent intent = Intent.parseUri(
+                  "intent:#Intent;component=com.android.settings/.DeviceAdminSettings;end",
+                  Intent.URI_INTENT_SCHEME);
+              intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              startActivity(intent);
+            } catch (Exception e) {
+              e.printStackTrace();
+            }
+          }
+        })
+        .setNegativeButton(R.string.dialog_cancel, null)
+        .show();
   }
 
   @Override
   protected void onActivityResult(int requestCode, int resultCode, Intent data) {
     super.onActivityResult(requestCode, resultCode, data);
-    if (resultCode == RESULT_OK) {
-      switch (requestCode) {
-        case 10001:
-          policyManager.lockNow();
-          break;
-      }
+    if (resultCode == RESULT_OK && requestCode == REQUEST_DEVICE_ADMIN) {
+      policyManager.lockNow();
     }
   }
 
-  public boolean isSystemApp(PackageInfo pInfo) {
-    return ((pInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0);
-  }
+  // =========================================================================
+  // 状态栏/系统应用判断/通知栏
+  // =========================================================================
 
-  public boolean isSystemUpdateApp(PackageInfo pInfo) {
-    return ((pInfo.applicationInfo.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0);
+  public void applyStatusBarVisibility() {
+    int flags = WindowManager.LayoutParams.FLAG_FULLSCREEN;
+    if (config.isShowStatusBar()) {
+      getWindow().setFlags(flags, flags);
+    } else {
+      getWindow().clearFlags(flags);
+    }
   }
 
   public boolean isUserApp(PackageInfo pInfo) {
-    return (!isSystemApp(pInfo) && !isSystemUpdateApp(pInfo));
+    return (pInfo.applicationInfo.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) == 0;
   }
 
-  public void toggleStatusBar(){
-    int windowFlags= WindowManager.LayoutParams.FLAG_FULLSCREEN;
-    if (Config.showStatusBar){
-      getWindow().setFlags(windowFlags,windowFlags);
-    }else{
-      getWindow().clearFlags(windowFlags);
-    }
-  }
-
-  private void checkLaunchHomeNotification(){
-    if (!TextUtils.equals(Build.DEVICE,"virgo-perf1")){
-      return;
-    }
+  private void checkLaunchHomeNotification() {
+    if (!TextUtils.equals(Build.DEVICE, "virgo-perf1")) return;
     Intent service = new Intent(this, HomeEntranceService.class);
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       startForegroundService(service);
-    }else{
+    } else {
       startService(service);
     }
   }
